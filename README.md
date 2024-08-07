@@ -95,6 +95,10 @@ Sample output image after training for 1000 epochs:
 
 ![Decoded Image Epoch 999](decoded_image_epoch_999.png)
 
+## Additional Resources
+
+For more information on cyclical annealing schedules in VAE training, check out this article: [A Must-Have Training Trick for VAE (Variational Autoencoder)](https://medium.com/@chengjing/a-must-have-training-trick-for-vae-variational-autoencoder-d28ff53b0023).
+
 ## License
 
 This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
@@ -102,4 +106,3 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 ---
 
 Feel free to open an issue or a pull request if you have any questions or suggestions!
-```

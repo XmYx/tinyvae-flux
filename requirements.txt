@@ -1,0 +1,7 @@
+torch
+torchvision
+accelerate
+transformers
+diffusers
+numpy
+pillow

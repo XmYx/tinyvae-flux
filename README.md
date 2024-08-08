@@ -20,7 +20,7 @@ This repository contains the implementation of a Tiny Variational Autoencoder (V
 1. Clone the repository:
 
 ```sh
-git clone https://github.com/XmYx/tinyvae-flux
+git clone https://github.com/XmYx/tinyvae-flux.git
 cd tinyvae-flux
 ```
 
@@ -97,7 +97,7 @@ Sample output image after training for 1000 epochs:
 
 ## Additional Resources
 
-For more information on cyclical annealing schedules in VAE training, check out this article: [A Must-Have Training Trick for VAE (Variational Autoencoder)](https://medium.com/@chengjing/a-must-have-training-trick-for-vae-variational-autoencoder-d28ff53b0023).
+For more information on cyclical annealing schedules in VAE training, check out this article: [A Must-Have Training Trick for VAE (Variational Autoencoder)](https://medium.com/@chengjing/a-must-have-training-trick-for-vae-variational-autoencoder-d28ff53b0023). and this paper: [HOW TO TRAIN YOUR VAE](https://arxiv.org/pdf/2309.13160)
 
 ## License
 

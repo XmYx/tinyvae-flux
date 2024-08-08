@@ -13,6 +13,61 @@ size = 1024
 
 def conv(n_in, n_out, **kwargs):
     return nn.Conv2d(n_in, n_out, 3, padding=1, **kwargs)
+def compute_kl_divergence(mean, logvar):
+    kl_div = -0.5 * torch.sum(1 + logvar - mean.pow(2) - logvar.exp())
+    return kl_div
+
+def new_kl_divergence(posterior_means, posterior_logvars, batch_size):
+    global_mean = torch.mean(posterior_means, dim=0)
+    global_var = torch.mean(posterior_logvars.exp(), dim=0)
+    kl_div = 0.5 * torch.sum(global_var + global_mean.pow(2) - 1 - torch.log(global_var))
+    return kl_div / batch_size
+def regularization_term(logvars):
+    reg_loss = torch.sum(logvars.exp() - 1 - logvars)
+    return reg_loss
+class PatchDiscriminator(nn.Module):
+    def __init__(self):
+        super(PatchDiscriminator, self).__init__()
+        self.model = nn.Sequential(
+            nn.Conv2d(3, 64, 4, stride=2, padding=1),
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.Conv2d(64, 128, 4, stride=2, padding=1),
+            nn.BatchNorm2d(128),
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.Conv2d(128, 256, 4, stride=2, padding=1),
+            nn.BatchNorm2d(256),
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.Conv2d(256, 512, 4, stride=2, padding=1),
+            nn.BatchNorm2d(512),
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.Conv2d(512, 1, 4, stride=1, padding=1)
+        )
+
+    def forward(self, img):
+        return self.model(img)
+
+def compute_loss(vae, discriminator, real_images, recon_images, latent_mean, latent_logvar, beta):
+    # Reconstruction loss
+    recon_loss = nn.MSELoss()(recon_images, real_images)
+
+    # KL divergence
+    kl_loss = new_kl_divergence(latent_mean, latent_logvar, real_images.size(0))
+
+    # Regularization term
+    reg_loss = regularization_term(latent_logvar)
+
+    # Discriminator loss
+    real_validity = discriminator(real_images)
+    fake_validity = discriminator(recon_images.detach())
+    d_loss_real = nn.BCEWithLogitsLoss()(real_validity, torch.ones_like(real_validity))
+    d_loss_fake = nn.BCEWithLogitsLoss()(fake_validity, torch.zeros_like(fake_validity))
+    d_loss = (d_loss_real + d_loss_fake) / 2
+
+    # Generator loss (VAE)
+    g_loss = nn.BCEWithLogitsLoss()(discriminator(recon_images), torch.ones_like(fake_validity))
+
+    elbo_loss = recon_loss + beta * (kl_loss + reg_loss) + g_loss
+    return elbo_loss, d_loss
 
 class Clamp(nn.Module):
     def forward(self, x):
@@ -157,67 +212,67 @@ def encode_dataset(dataset, model, device):
             encoded_images.append(preprocessed_images.cpu())
     return torch.cat(encoded_images, dim=0)
 
-def train_epoch(model, dataloader, encoded_images, batch_size, optimizer, criterion, device, vae, processor, beta, scaler, accelerator):
+
+def train_epoch(model, discriminator, dataloader, encoded_images, batch_size, optimizer, optimizer_d, criterion, device,
+                vae, processor, beta, scaler, accelerator):
     model.train()
+    discriminator.train()
     total_encoder_loss = 0
     total_decoder_loss = 0
     for i, images in enumerate(dataloader):
         preprocessed_images = encoded_images[i * batch_size:(i + 1) * batch_size].to(device)
-        # ground_truth_latents = vae.encode(preprocessed_images.half()).latent_dist.sample().detach()
         with torch.inference_mode():
-
             ground_truth_latents = []
-            for batch in DataLoader(preprocessed_images, batch_size=1):  # Adjust batch size as needed
-                    ground_truth_latents.append(vae.encode(batch.half().to(device)).latent_dist.sample().cpu().detach())
+            for batch in DataLoader(preprocessed_images, batch_size=1):
+                ground_truth_latents.append(vae.encode(batch.half().to(device)).latent_dist.sample().cpu().detach())
             ground_truth_latents = torch.cat(ground_truth_latents).to(device)
 
         optimizer.zero_grad()
+        optimizer_d.zero_grad()
 
         with accelerator.autocast():
             encoded = model.encoder(preprocessed_images)
-            decoded = model.decoder(ground_truth_latents)
-            encoder_loss = criterion(encoded, ground_truth_latents) * beta
-            decoder_loss = criterion(decoded, preprocessed_images) * beta
-            loss = encoder_loss + decoder_loss
+            decoded = model.decoder(encoded)
 
+            elbo_loss, d_loss = compute_loss(model, discriminator, preprocessed_images, decoded, encoded,
+                                             ground_truth_latents, beta)
 
-
-        accelerator.backward(scaler.scale(loss))
+        accelerator.backward(scaler.scale(elbo_loss))
         scaler.step(optimizer)
         scaler.update()
-        total_encoder_loss += encoder_loss.item()
-        total_decoder_loss += decoder_loss.item()
+
+        accelerator.backward(scaler.scale(d_loss))
+        scaler.step(optimizer_d)
+        scaler.update()
+
+        total_encoder_loss += elbo_loss.item()
+        total_decoder_loss += d_loss.item()
 
     return total_encoder_loss / len(dataloader), total_decoder_loss / len(dataloader)
 
-def test_epoch(model, dataloader, encoded_images, criterion, device, vae, processor, beta, accelerator):
-    model.eval()
-    total_loss = 0
-    with torch.no_grad():
-        for i, images in enumerate(dataloader):
-            preprocessed_images = encoded_images[i * dataloader.batch_size:(i + 1) * dataloader.batch_size].to(device)
-            ground_truth_latents = vae.encode(preprocessed_images.half()).latent_dist.sample().detach()
-            with accelerator.autocast():
-                encoded = model.encoder(preprocessed_images)
-                loss = criterion(encoded, ground_truth_latents) * beta
-            total_loss += loss.item()
-    return total_loss / len(dataloader)
 
 def main(data_folder, output_folder, epochs=100000, batch_size=8, learning_rate=0.0005, n_cycles=10):
     accelerator = Accelerator(mixed_precision='fp16')
     device = accelerator.device
-    size = 512  # Assuming the image size is 512x512
+    size = 512
     transform = transforms.Compose([
         transforms.Resize((size, size)),
         transforms.ToTensor(),
     ])
     dataset = ImageFolderDataset(data_folder, transform)
     dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=4, pin_memory=True)
-    model = TinyAutoEncoder(size_variant='pico').to(device)
-    vae = AutoencoderKL.from_pretrained("black-forest-labs/FLUX.1-schnell", subfolder='vae', torch_dtype=torch.float16).to(device)
+    model = TinyAutoEncoder(size_variant='tiny').to(device)
+    discriminator = PatchDiscriminator().to(device)
+
+    # model.decoder.load_state_dict(torch.load('/home/mix/Playground/flux_base/output_100k/tiny_decoder_epoch_360.pth'))
+    # model.encoder.load_state_dict(torch.load('/home/mix/Playground/flux_base/output_100k/tiny_encoder_epoch_360.pth'))
+
+    vae = AutoencoderKL.from_pretrained("black-forest-labs/FLUX.1-schnell", subfolder='vae',
+                                        torch_dtype=torch.float16).to(device)
     processor = VaeImageProcessor(vae_scale_factor=16, vae_latent_channels=16)
     criterion = nn.MSELoss()
     optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
+    optimizer_d = torch.optim.Adam(discriminator.parameters(), lr=learning_rate)
     scaler = torch.amp.GradScaler('cuda')
     scheduler = CyclicalAnnealingScheduler(epochs, n_cycles)
     if not os.path.exists(output_folder):
@@ -227,23 +282,34 @@ def main(data_folder, output_folder, epochs=100000, batch_size=8, learning_rate=
     model, optimizer, dataloader = accelerator.prepare(model, optimizer, dataloader)
     vae = vae.to(device, dtype=torch.float16)
 
-    # Encode the dataset
     encoded_images = encode_dataset(dataset, vae, device)
 
     for epoch in range(epochs):
         beta = scheduler.get_beta(epoch)
-        train_encoder_loss, train_decoder_loss = train_epoch(model, dataloader, encoded_images, batch_size, optimizer, criterion, device, vae, processor, beta, scaler, accelerator)
-        print(f"Epoch {epoch+1}/{epochs}, Train Encoder Loss: {train_encoder_loss}, Train Decoder Loss: {train_decoder_loss}, Beta: {beta}")
+        train_encoder_loss, train_decoder_loss = train_epoch(model, discriminator, dataloader, encoded_images,
+                                                             batch_size, optimizer, optimizer_d, criterion, device, vae,
+                                                             processor, beta, scaler, accelerator)
+        print(
+            f"Epoch {epoch + 1}/{epochs}, Train Encoder Loss: {train_encoder_loss}, Train Decoder Loss: {train_decoder_loss}, Beta: {beta}")
         if (epoch + 1) % save_per_epoch == 0:
-            torch.save(model.encoder.state_dict(), os.path.join(output_folder, f"tiny_encoder_epoch_{epoch+1}.pth"))
-            torch.save(model.decoder.state_dict(), os.path.join(output_folder, f"tiny_decoder_epoch_{epoch+1}.pth"))
+            torch.save(model.encoder.state_dict(), os.path.join(output_folder, f"tiny_encoder_epoch_{epoch + 1}.pth"))
+            torch.save(model.decoder.state_dict(), os.path.join(output_folder, f"tiny_decoder_epoch_{epoch + 1}.pth"))
         with torch.no_grad():
             sample_img = next(iter(dataloader)).to(device)
             preprocessed = processor.preprocess(sample_img, width=size, height=size)
             encoded_sample = model.encoder(preprocessed)
             decoded_sample = model.decoder(encoded_sample)
             postprocessed_image = postprocess(decoded_sample[0])
-            postprocessed_image.save(os.path.join(output_folder, f"decoded_image_epoch_{epoch+1}.png"))
+            postprocessed_image.save(os.path.join(output_folder, f"decoded_image_epoch_{epoch + 1}.png"))
+
+
+if __name__ == "__main__":
+    import sys
+
+    if len(sys.argv) != 3:
+        print("Usage: python script.py <data_folder> <output_folder>")
+    else:
+        main(sys.argv[1], sys.argv[2])
 
 if __name__ == "__main__":
     import sys

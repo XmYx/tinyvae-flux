@@ -140,15 +140,9 @@ def train_epoch(model, dataloader, optimizer, criterion, device, vae, processor,
             ground_truth_latents = vae.encode(preprocessed_images).latent_dist.sample().detach()
         optimizer.zero_grad()
         encoded = model.encoder(preprocessed_images)
-
-        print(encoded.shape)
-
-        decoded = model.decoder(encoded)
-
         encoder_loss = criterion(encoded, ground_truth_latents) * beta
 
-        print(decoded.shape, preprocessed_images.shape)
-
+        decoded = model.decoder(ground_truth_latents)
         decoder_loss = criterion(decoded, preprocessed_images) * beta
 
         loss = encoder_loss + decoder_loss

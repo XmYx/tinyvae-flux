@@ -1,11 +1,15 @@
 import torch
 import torch.nn as nn
 from diffusers.image_processor import VaeImageProcessor
+from torch.cuda import amp
 from torch.utils.data import DataLoader, Dataset
 import torchvision.transforms as transforms
 from PIL import Image
 import os
 from diffusers import AutoencoderKL
+from accelerate import Accelerator
+
+size = 1024
 
 def conv(n_in, n_out, **kwargs):
     return nn.Conv2d(n_in, n_out, 3, padding=1, **kwargs)
@@ -84,7 +88,7 @@ class ImageFolderDataset(Dataset):
         return len(self.image_paths)
 
     def __getitem__(self, idx):
-        image = Image.open(self.image_paths[idx]).convert("RGB").resize((512,512), resample=Image.Resampling.LANCZOS)
+        image = Image.open(self.image_paths[idx]).convert("RGB").resize((size, size), resample=Image.Resampling.LANCZOS)
         if self.transform:
             image = self.transform(image)
         return image
@@ -128,73 +132,105 @@ class CyclicalAnnealingScheduler:
         else:
             return 1.0
 
+def encode_dataset(dataset, model, device):
+    processor = VaeImageProcessor(vae_scale_factor=16, vae_latent_channels=16)
+    model.eval()
+    encoded_images = []
+    with torch.no_grad():
+        for images in DataLoader(dataset, batch_size=32, num_workers=4, pin_memory=True):
+            images = images.to(device)
+            preprocessed_images = processor.preprocess(images, height=size, width=size)
+            encoded_images.append(preprocessed_images.cpu())
+    return torch.cat(encoded_images, dim=0)
 
-def train_epoch(model, dataloader, optimizer, criterion, device, vae, processor, beta):
+def train_epoch(model, dataloader, encoded_images, batch_size, optimizer, criterion, device, vae, processor, beta, scaler, accelerator):
     model.train()
     total_encoder_loss = 0
     total_decoder_loss = 0
-    for images in dataloader:
-        images = images.to(device)
-        with torch.no_grad():
-            preprocessed_images = processor.preprocess(images, height=512, width=512)
-            ground_truth_latents = vae.encode(preprocessed_images).latent_dist.sample().detach()
+    for i, images in enumerate(dataloader):
+        preprocessed_images = encoded_images[i * batch_size:(i + 1) * batch_size].to(device)
+        # ground_truth_latents = vae.encode(preprocessed_images.half()).latent_dist.sample().detach()
+        with torch.inference_mode():
+
+            ground_truth_latents = []
+            for batch in DataLoader(preprocessed_images, batch_size=1):  # Adjust batch size as needed
+                    ground_truth_latents.append(vae.encode(batch.half().to(device)).latent_dist.sample().cpu().detach())
+            ground_truth_latents = torch.cat(ground_truth_latents).to(device)
+
         optimizer.zero_grad()
-        encoded = model.encoder(preprocessed_images)
-        encoder_loss = criterion(encoded, ground_truth_latents) * beta
 
-        decoded = model.decoder(ground_truth_latents)
-        decoder_loss = criterion(decoded, preprocessed_images) * beta
+        with accelerator.autocast():
+            encoded = model.encoder(preprocessed_images)
+            decoded = model.decoder(ground_truth_latents)
+            encoder_loss = criterion(encoded, ground_truth_latents) * beta
+            decoder_loss = criterion(decoded, preprocessed_images) * beta
+            loss = encoder_loss + decoder_loss
 
-        loss = encoder_loss + decoder_loss
-        loss.backward()
-        optimizer.step()
+            # preprocessed_images = preprocessed_images.cpu()
+            # ground_truth_latents = ground_truth_latents.cpu()
+            # encoded = encoded.cpu()
+            # decoded = decoded.cpu()
+            # torch.cuda.empty_cache()
+            # torch.cuda.synchronize('cuda')
 
+        accelerator.backward(scaler.scale(loss))
+        scaler.step(optimizer)
+        scaler.update()
         total_encoder_loss += encoder_loss.item()
         total_decoder_loss += decoder_loss.item()
 
     return total_encoder_loss / len(dataloader), total_decoder_loss / len(dataloader)
 
-
-def test_epoch(model, dataloader, criterion, device, vae, processor, beta):
+def test_epoch(model, dataloader, encoded_images, criterion, device, vae, processor, beta, accelerator):
     model.eval()
     total_loss = 0
     with torch.no_grad():
-        for images in dataloader:
-            images = images.to(device)
-            preprocessed_images = processor.preprocess(images, height=512, width=512)
-            ground_truth_latents = vae.encode(preprocessed_images).latent_dist.sample().detach()
-            encoded = model.encoder(preprocessed_images)
-            loss = criterion(encoded, ground_truth_latents) * beta
+        for i, images in enumerate(dataloader):
+            preprocessed_images = encoded_images[i * dataloader.batch_size:(i + 1) * dataloader.batch_size].to(device)
+            ground_truth_latents = vae.encode(preprocessed_images.half()).latent_dist.sample().detach()
+            with accelerator.autocast():
+                encoded = model.encoder(preprocessed_images)
+                loss = criterion(encoded, ground_truth_latents) * beta
             total_loss += loss.item()
     return total_loss / len(dataloader)
 
-def main(data_folder, output_folder, epochs=1000, batch_size=5, learning_rate=0.0005, n_cycles=10):
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+def main(data_folder, output_folder, epochs=100000, batch_size=8, learning_rate=0.0005, n_cycles=10):
+    accelerator = Accelerator(mixed_precision='fp16')
+    device = accelerator.device
+    size = 512  # Assuming the image size is 512x512
     transform = transforms.Compose([
-        transforms.Resize((512, 512)),
+        transforms.Resize((size, size)),
         transforms.ToTensor(),
     ])
     dataset = ImageFolderDataset(data_folder, transform)
-    dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
+    dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=4, pin_memory=True)
     model = TinyAutoEncoder(size_variant='tiny').to(device)
-    vae = AutoencoderKL.from_pretrained("black-forest-labs/FLUX.1-schnell", subfolder='vae').to(device)
+    vae = AutoencoderKL.from_pretrained("black-forest-labs/FLUX.1-schnell", subfolder='vae', torch_dtype=torch.float16).to(device)
     processor = VaeImageProcessor(vae_scale_factor=16, vae_latent_channels=16)
     criterion = nn.MSELoss()
     optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
+    scaler = torch.amp.GradScaler('cuda')
     scheduler = CyclicalAnnealingScheduler(epochs, n_cycles)
     if not os.path.exists(output_folder):
         os.makedirs(output_folder)
-    save_per_epoch = 100
+    save_per_epoch = 10
+
+    model, optimizer, dataloader = accelerator.prepare(model, optimizer, dataloader)
+    vae = vae.to(device, dtype=torch.float16)
+
+    # Encode the dataset
+    encoded_images = encode_dataset(dataset, vae, device)
+
     for epoch in range(epochs):
         beta = scheduler.get_beta(epoch)
-        train_loss = train_epoch(model, dataloader, optimizer, criterion, device, vae, processor, beta)
-        print(f"Epoch {epoch+1}/{epochs}, Train Loss: {train_loss}, Beta: {beta}")
+        train_encoder_loss, train_decoder_loss = train_epoch(model, dataloader, encoded_images, batch_size, optimizer, criterion, device, vae, processor, beta, scaler, accelerator)
+        print(f"Epoch {epoch+1}/{epochs}, Train Encoder Loss: {train_encoder_loss}, Train Decoder Loss: {train_decoder_loss}, Beta: {beta}")
         if (epoch + 1) % save_per_epoch == 0:
             torch.save(model.encoder.state_dict(), os.path.join(output_folder, f"tiny_encoder_epoch_{epoch+1}.pth"))
             torch.save(model.decoder.state_dict(), os.path.join(output_folder, f"tiny_decoder_epoch_{epoch+1}.pth"))
         with torch.no_grad():
             sample_img = next(iter(dataloader)).to(device)
-            preprocessed = processor.preprocess(sample_img, width=512, height=512)
+            preprocessed = processor.preprocess(sample_img, width=size, height=size)
             encoded_sample = model.encoder(preprocessed)
             decoded_sample = model.decoder(encoded_sample)
             postprocessed_image = postprocess(decoded_sample[0])

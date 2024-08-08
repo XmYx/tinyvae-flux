@@ -28,7 +28,13 @@ class Block(nn.Module):
         return self.fuse(self.conv(x) + self.skip(x))
 
 def Encoder(latent_channels=16, size_variant='normal'):
-    if size_variant == 'tiny':
+    if size_variant == 'pico':
+        channels = [4, 8, 16, 32]
+    elif size_variant == 'nano':
+        channels = [16, 32, 64, 128]
+    elif size_variant == 'micro':
+        channels = [24, 48, 96, 192]
+    elif size_variant == 'tiny':
         channels = [32, 64, 128, 256]
     elif size_variant == 'small':
         channels = [64, 128, 256, 512]
@@ -43,7 +49,15 @@ def Encoder(latent_channels=16, size_variant='normal'):
     )
 
 def Decoder(latent_channels=16, size_variant='normal'):
-    if size_variant == 'tiny':
+    if size_variant == 'pico':
+        channels = [32, 16, 8, 4]
+
+    elif size_variant == 'nano':
+        channels = [128, 64, 32, 16]
+    elif size_variant == 'micro':
+        channels = [192, 96, 48, 24]
+
+    elif size_variant == 'tiny':
         channels = [256, 128, 64, 32]
     elif size_variant == 'small':
         channels = [512, 256, 128, 64]
@@ -166,12 +180,7 @@ def train_epoch(model, dataloader, encoded_images, batch_size, optimizer, criter
             decoder_loss = criterion(decoded, preprocessed_images) * beta
             loss = encoder_loss + decoder_loss
 
-            # preprocessed_images = preprocessed_images.cpu()
-            # ground_truth_latents = ground_truth_latents.cpu()
-            # encoded = encoded.cpu()
-            # decoded = decoded.cpu()
-            # torch.cuda.empty_cache()
-            # torch.cuda.synchronize('cuda')
+
 
         accelerator.backward(scaler.scale(loss))
         scaler.step(optimizer)
@@ -204,7 +213,7 @@ def main(data_folder, output_folder, epochs=100000, batch_size=8, learning_rate=
     ])
     dataset = ImageFolderDataset(data_folder, transform)
     dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=4, pin_memory=True)
-    model = TinyAutoEncoder(size_variant='tiny').to(device)
+    model = TinyAutoEncoder(size_variant='pico').to(device)
     vae = AutoencoderKL.from_pretrained("black-forest-labs/FLUX.1-schnell", subfolder='vae', torch_dtype=torch.float16).to(device)
     processor = VaeImageProcessor(vae_scale_factor=16, vae_latent_channels=16)
     criterion = nn.MSELoss()

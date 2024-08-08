@@ -1,9 +1,6 @@
-import copy
-
 import torch
 import torch.nn as nn
 from diffusers.image_processor import VaeImageProcessor
-from torch.cuda import amp
 from torch.utils.data import DataLoader, Dataset
 import torchvision.transforms as transforms
 from PIL import Image
@@ -12,11 +9,29 @@ from diffusers import AutoencoderKL
 from accelerate import Accelerator
 from tqdm import tqdm
 
-size = 512
+from datasets import load_dataset
 
 def conv(n_in, n_out, **kwargs):
     return nn.Conv2d(n_in, n_out, 3, padding=1, **kwargs)
 
+
+class CustomDataset(Dataset):
+    def __init__(self, images, encoded_latents, transform=None):
+        self.images = images
+        self.encoded_latents = encoded_latents
+        self.transform = transform
+
+    def __len__(self):
+        return len(self.images)
+
+    def __getitem__(self, idx):
+        image = self.images[idx]
+        encoded_latent = self.encoded_latents[idx]
+
+        if self.transform:
+            image = self.transform(image)
+
+        return image, encoded_latent
 class Clamp(nn.Module):
     def forward(self, x):
         return torch.tanh(x / 3) * 3
@@ -90,26 +105,7 @@ class ImageFolderDataset(Dataset):
         image = Image.open(self.image_paths[idx]).convert("RGB").resize((size, size), resample=Image.Resampling.LANCZOS)
         if self.transform:
             image = self.transform(image)
-        return image
-
-def load_matching_layers(tiny_model, vae):
-    vae_state_dict = vae.state_dict()
-    tiny_encoder_dict = tiny_model.encoder.state_dict()
-    tiny_decoder_dict = tiny_model.decoder.state_dict()
-    for name, param in tiny_encoder_dict.items():
-        for vae_name, vae_param in vae_state_dict.items():
-            if param.shape == vae_param.shape:
-                print(f"Loading encoder layer: {name} from VAE layer: {vae_name}")
-                tiny_encoder_dict[name].copy_(vae_param)
-                break
-    for name, param in tiny_decoder_dict.items():
-        for vae_name, vae_param in vae_state_dict.items():
-            if param.shape == vae_param.shape:
-                print(f"Loading decoder layer: {name} from VAE layer: {vae_name}")
-                tiny_decoder_dict[name].copy_(vae_param)
-                break
-    tiny_model.encoder.load_state_dict(tiny_encoder_dict)
-    tiny_model.decoder.load_state_dict(tiny_decoder_dict)
+        return {"image":image}
 
 def postprocess(tensor):
     tensor = (tensor * 0.5 + 0.5) * 255
@@ -131,38 +127,42 @@ class CyclicalAnnealingScheduler:
         else:
             return 1.0
 
-def encode_dataset(dataset, model, device):
+def encode_dataset(dataset, vae, device, batch_size, size):
     processor = VaeImageProcessor(vae_scale_factor=16, vae_latent_channels=16)
-    model.eval()
+    vae.eval()
     encoded_images = []
+    preprocessed_images = []
     with torch.no_grad():
-        for images in DataLoader(dataset, batch_size=32, num_workers=4, pin_memory=True):
-            images = images.to(device)
-            preprocessed_images = processor.preprocess(images, height=size, width=size)
-            encoded_images.append(preprocessed_images.cpu())
-    return torch.cat(encoded_images, dim=0)
+        for images in DataLoader(dataset, batch_size=batch_size, num_workers=4, pin_memory=True):
+            images = images['image'].to(device)
+            preprocessed = processor.preprocess(images, height=size, width=size)
+            preprocessed_images.append(preprocessed.cpu())
+            latents = vae.encode(preprocessed.half()).latent_dist.sample().cpu()
+            encoded_images.append(latents)
+    return torch.cat(preprocessed_images), torch.cat(encoded_images)
 
-def train_epoch(model, dataloader, encoded_images, batch_size, optimizer, criterion, device, vae, processor, beta, scaler, accelerator):
+def train_epoch(model, dataloader, optimizer, criterion, device, beta, scaler, accelerator):
     model.train()
     total_encoder_loss = 0
     total_decoder_loss = 0
-    for i, images in enumerate(dataloader):
-        preprocessed_images = encoded_images[i * batch_size:(i + 1) * batch_size].to(device)
-        with torch.inference_mode():
-
-            ground_truth_latents = []
-            for batch in DataLoader(preprocessed_images, batch_size=1):  # Adjust batch size as needed
-                    ground_truth_latents.append(vae.encode(batch.half().to(device)).latent_dist.sample().cpu().detach())
-            ground_truth_latents = torch.cat(ground_truth_latents).to(device)
-
+    for images, ground_truth_latents in dataloader:
+        images = images.to(device)
+        ground_truth_latents = ground_truth_latents.to(device)
+        # print(images.shape, ground_truth_latents.shape)
         optimizer.zero_grad()
 
         with accelerator.autocast():
-            encoded = model.encoder(preprocessed_images)
+            encoded = model.encoder(images)
             decoded = model.decoder(ground_truth_latents)
             encoder_loss = criterion(encoded, ground_truth_latents) * beta
-            decoder_loss = criterion(decoded, preprocessed_images) * beta
-            loss = encoder_loss + decoder_loss
+            decoder_loss = criterion(decoded, images) * beta
+
+            # Additional adversarial loss
+            pooled_real_images = nn.functional.avg_pool2d(images, 8)
+            pooled_decoded_images = nn.functional.avg_pool2d(decoded, 8)
+            adversarial_loss = criterion(pooled_decoded_images, pooled_real_images)
+
+            loss = encoder_loss + decoder_loss + adversarial_loss
 
         accelerator.backward(scaler.scale(loss))
         scaler.step(optimizer)
@@ -173,16 +173,42 @@ def train_epoch(model, dataloader, encoded_images, batch_size, optimizer, criter
     return total_encoder_loss / len(dataloader), total_decoder_loss / len(dataloader)
 
 
-def main(data_folder, output_folder, epochs=100000, batch_size=8, learning_rate=0.0005, n_cycles=10):
+def main(data_folder, output_folder, epochs=100000, batch_size=8, learning_rate=0.0003, n_cycles=10):
     accelerator = Accelerator(mixed_precision='fp16')
     device = accelerator.device
-    size = 512  # Assuming the image size is 512x512
+    size = 1024  # Assuming the image size is 512x512
     transform = transforms.Compose([
         transforms.Resize((size, size)),
         transforms.ToTensor(),
+        transforms.ColorJitter(hue=0.1, saturation=0.1)  # Color augmentation
     ])
-    dataset = ImageFolderDataset(data_folder, transform)
-    dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=4, pin_memory=True)
+
+    use_folder = False
+
+    if use_folder:
+        dataset = ImageFolderDataset(data_folder, transform)
+
+    else:
+        dataset = load_dataset("fantasyfish/laion-art", split='train')
+
+    # Apply the function to each example in the dataset
+    dataset = dataset.shuffle(seed=42).select(range(500))
+    # dataset = load_dataset("fantasyfish/laion-art", split='train')
+
+    # Define a function to load and transform the images
+    def load_and_transform_image(example):
+        # Load the image from the URL
+        image = example['image'].convert("RGB")
+
+        # Apply the transformations
+        image = transform(image)
+        return image
+
+    # Apply the function to each example in the dataset
+    dataset = dataset.map(lambda example: {'image': load_and_transform_image(example)}, batched=False, num_proc=1)
+
+    # Remove the other columns (optional)
+    dataset.set_format(type='torch', columns=['image'])
 
     # Define the size variants
     size_variants = {
@@ -202,47 +228,51 @@ def main(data_folder, output_folder, epochs=100000, batch_size=8, learning_rate=
         'normal': [128, 256, 512, 1024],
         'large': [256, 512, 1024, 2048],
     }
-    channels = size_variants.get('yocto', size_variants['normal'])
+    var = 'tiny'
+    channels = size_variants.get(var, size_variants['normal'])
 
     model = TinyAutoEncoder(channels=channels).to(device)
 
-    # model.decoder.load_state_dict(torch.load('/home/mix/Playground/flux_base/output_dynamic/tiny_decoder_epoch_2740.pth'))
-    # model.encoder.load_state_dict(torch.load('/home/mix/Playground/flux_base/output_dynamic/tiny_encoder_epoch_2740.pth'))
+    # model.decoder.load_state_dict(torch.load('/home/mix/Playground/flux_base/output_nanometer/nanometer_decoder_flux_130.pth'))
+    # model.encoder.load_state_dict(torch.load('/home/mix/Playground/flux_base/output_nanometer/nanometer_encoder_flux_130.pth'))
 
     vae = AutoencoderKL.from_pretrained("black-forest-labs/FLUX.1-schnell", subfolder='vae', torch_dtype=torch.float16).to(device)
     processor = VaeImageProcessor(vae_scale_factor=16, vae_latent_channels=16)
     criterion = nn.MSELoss()
-    optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
+    optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate, betas=(0.9, 0.9), amsgrad=True)
     scaler = torch.amp.GradScaler('cuda')
     scheduler = CyclicalAnnealingScheduler(epochs, n_cycles)
     if not os.path.exists(output_folder):
         os.makedirs(output_folder)
     save_per_epoch = 10
+    vae = vae.to(device, dtype=torch.float16)
+    # Encode the dataset
+    preprocessed_images, encoded_images = encode_dataset(dataset, vae, device, 4, size)
+    # Create custom dataset with preprocessed images and encoded latents
+    custom_dataset = CustomDataset(preprocessed_images, encoded_images, transform=None)
+    dataloader = DataLoader(custom_dataset, batch_size=batch_size, shuffle=True, num_workers=8, pin_memory=True)
 
     model, optimizer, dataloader = accelerator.prepare(model, optimizer, dataloader)
-    vae = vae.to(device, dtype=torch.float16)
-
-    # Encode the dataset
-    encoded_images = encode_dataset(dataset, vae, device)
 
     epoch_progress = tqdm(range(epochs), desc="Training", unit="epoch")
 
     for epoch in epoch_progress:
         beta = scheduler.get_beta(epoch)
-        train_encoder_loss, train_decoder_loss = train_epoch(model, dataloader, encoded_images, batch_size, optimizer, criterion, device, vae, processor, beta, scaler, accelerator)
+        train_encoder_loss, train_decoder_loss = train_epoch(model, dataloader, optimizer, criterion, device, beta, scaler, accelerator)
         epoch_progress.set_postfix(encoder_loss=train_encoder_loss, decoder_loss=train_decoder_loss, beta=beta)
 
-        #print(f"Epoch {epoch+1}/{epochs}, Train Encoder Loss: {train_encoder_loss}, Train Decoder Loss: {train_decoder_loss}, Beta: {beta}")
         if (epoch + 1) % save_per_epoch == 0:
-            torch.save(model.encoder.state_dict(), os.path.join(output_folder, f"tiny_encoder_epoch_{epoch+1}.pth"))
-            torch.save(model.decoder.state_dict(), os.path.join(output_folder, f"tiny_decoder_epoch_{epoch+1}.pth"))
+            torch.save(model.encoder.state_dict(), os.path.join(output_folder, f"{var}_encoder_flux_{epoch+1}.pth"))
+            torch.save(model.decoder.state_dict(), os.path.join(output_folder, f"{var}_decoder_flux_{epoch+1}.pth"))
         with torch.no_grad():
-            sample_img = next(iter(dataloader)).to(device)
-            preprocessed = processor.preprocess(sample_img, width=size, height=size)
+            # sample_img, _ = next(iter(dataloader))
+            # sample_img = sample_img.to(device)
+            pil_img = Image.open('input.jpg')
+            preprocessed = processor.preprocess(pil_img, width=512, height=512).to(device)
             encoded_sample = model.encoder(preprocessed)
             decoded_sample = model.decoder(encoded_sample)
             postprocessed_image = postprocess(decoded_sample[0])
-            postprocessed_image.save(os.path.join(output_folder, f"decoded_image_epoch_{epoch+1}.png"))
+            postprocessed_image.save(os.path.join(output_folder, f"decoded_image_{var}_{epoch+1}.png"))
 
 if __name__ == "__main__":
     import sys

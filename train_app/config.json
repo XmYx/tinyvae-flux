@@ -1,0 +1,71 @@
+{
+    "window": {
+        "title": "VAE Training Interface",
+        "size": [800, 600]
+    },
+    "widgets": [
+        {
+            "type": "checkbox",
+            "label": "Use Image Folder",
+            "id": "use_folder"
+        },
+        {
+            "type": "checkbox",
+            "label": "Use Dataset",
+            "id": "use_dataset"
+        },
+        {
+            "type": "folder_select",
+            "label": "Select Input Folder:",
+            "id": "input_folder"
+        },
+        {
+            "type": "folder_select",
+            "label": "Select Output Folder:",
+            "id": "output_folder"
+        },
+        {
+            "type": "combobox",
+            "label": "Select Optimizer:",
+            "id": "optimizer_name",
+            "options": ["adam", "adamw", "adamw8bit", "adamw_bf16", "adafactor", "sgd", "rmsprop", "prodigy"],
+            "default": "adam"
+        },
+        {
+            "type": "combobox",
+            "label": "Select Channels Variant:",
+            "id": "channels_variant",
+            "options": ["millizepto", "decazepto", "zepto", "yocto", "zeptometer", "yoctometer", "angstrom", "attometer", "nanometer", "micrometer", "pico", "nano", "micro", "tiny", "small", "normal", "large", "mega"],
+            "default": "tiny"
+        },
+        {
+            "type": "lineedit",
+            "label": "Epochs:",
+            "id": "epochs",
+            "default": "100000"
+        },
+        {
+            "type": "lineedit",
+            "label": "Batch Size:",
+            "id": "batch_size",
+            "default": "8"
+        },
+        {
+            "type": "lineedit",
+            "label": "Learning Rate:",
+            "id": "learning_rate",
+            "default": "0.0003"
+        },
+        {
+            "type": "lineedit",
+            "label": "Number of Cycles:",
+            "id": "cycles",
+            "default": "10"
+        },
+        {
+            "type": "checkbox",
+            "label": "Resume Training",
+            "id": "resume_training"
+        }
+    ]
+}
